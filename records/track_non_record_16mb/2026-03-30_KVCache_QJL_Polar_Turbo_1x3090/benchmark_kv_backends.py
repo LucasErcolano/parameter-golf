@@ -20,12 +20,21 @@ def build_args() -> SimpleNamespace:
     )
 
 
+def bytes_to_mib(nbytes: int) -> float:
+    return float(nbytes) / (1024.0 * 1024.0)
+
+
 def time_backend(backend, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, warmup: int, iters: int) -> dict[str, float]:
+    torch.cuda.empty_cache()
     cache = backend.append(None, k, v, max_len=k.size(2))
     score = backend.score(q, cache["k"])
     probs = torch.softmax(score.float(), dim=-1).to(dtype=q.dtype)
     out = backend.apply(probs, cache["v"])
     torch.cuda.synchronize()
+
+    baseline_allocated = int(torch.cuda.memory_allocated())
+    baseline_reserved = int(torch.cuda.memory_reserved())
+    torch.cuda.reset_peak_memory_stats()
 
     for _ in range(warmup):
         score = backend.score(q, cache["k"])
@@ -53,10 +62,18 @@ def time_backend(backend, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, 
         out = backend.apply(probs, cache["v"])
     torch.cuda.synchronize()
     total_ms = 1000.0 * (time.perf_counter() - t0) / iters
+    peak_allocated = int(torch.cuda.max_memory_allocated())
+    peak_reserved = int(torch.cuda.max_memory_reserved())
     return {
         "score_ms": score_ms,
         "apply_ms": apply_ms,
         "total_ms": total_ms,
+        "baseline_allocated_bytes": baseline_allocated,
+        "baseline_reserved_bytes": baseline_reserved,
+        "peak_allocated_bytes": peak_allocated,
+        "peak_reserved_bytes": peak_reserved,
+        "peak_extra_allocated_bytes": max(0, peak_allocated - baseline_allocated),
+        "peak_extra_reserved_bytes": max(0, peak_reserved - baseline_reserved),
         "score": score.detach(),
         "out": out.detach(),
     }
@@ -74,11 +91,15 @@ def compare_pair(name_a: str, name_b: str, args, q: torch.Tensor, k: torch.Tenso
     speedup = stats_a["total_ms"] / max(stats_b["total_ms"], 1e-9)
     print(
         f"{name_a:>12} total_ms={stats_a['total_ms']:.4f} "
-        f"(score={stats_a['score_ms']:.4f} apply={stats_a['apply_ms']:.4f})"
+        f"(score={stats_a['score_ms']:.4f} apply={stats_a['apply_ms']:.4f}) "
+        f"peak_alloc={bytes_to_mib(stats_a['peak_allocated_bytes']):.2f}MiB "
+        f"peak_over_baseline={bytes_to_mib(stats_a['peak_extra_allocated_bytes']):.2f}MiB"
     )
     print(
         f"{name_b:>12} total_ms={stats_b['total_ms']:.4f} "
-        f"(score={stats_b['score_ms']:.4f} apply={stats_b['apply_ms']:.4f})"
+        f"(score={stats_b['score_ms']:.4f} apply={stats_b['apply_ms']:.4f}) "
+        f"peak_alloc={bytes_to_mib(stats_b['peak_allocated_bytes']):.2f}MiB "
+        f"peak_over_baseline={bytes_to_mib(stats_b['peak_extra_allocated_bytes']):.2f}MiB"
     )
     print(f"{name_b:>12} speedup_vs_{name_a}={speedup:.2f}x score_max_abs={score_diff:.6e} out_max_abs={out_diff:.6e}")
 
