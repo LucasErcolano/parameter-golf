@@ -28,6 +28,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from triton_kv_ops import grouped_apply as triton_grouped_apply
+from triton_kv_ops import grouped_score as triton_grouped_score
+from triton_kv_ops import qjl_score as triton_qjl_score
+from triton_kv_ops import triton_is_available
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -879,11 +884,11 @@ class Int8KVCacheBackend(KVCacheBackend):
         return out
 
     def score(self, q: Tensor, encoded_k: dict[str, Any]) -> Tensor:
-        k = expand_kv_heads(dequantize_grouped_symmetric(encoded_k["k"], dtype=q.dtype), self.num_heads)
+        k = expand_kv_heads(dequantize_grouped_symmetric(encoded_k, dtype=q.dtype), self.num_heads)
         return torch.matmul(q.float(), k.transpose(-1, -2).float()) / math.sqrt(self.head_dim)
 
     def apply(self, attn_probs: Tensor, encoded_v: dict[str, Any]) -> Tensor:
-        v = expand_kv_heads(dequantize_grouped_symmetric(encoded_v["v"], dtype=attn_probs.dtype), self.num_heads)
+        v = expand_kv_heads(dequantize_grouped_symmetric(encoded_v, dtype=attn_probs.dtype), self.num_heads)
         return torch.matmul(attn_probs.float(), v.float()).to(dtype=attn_probs.dtype)
 
     def cache_nbytes(self, cache: dict[str, Any] | None) -> int:
@@ -895,6 +900,33 @@ class Int8KVCacheBackend(KVCacheBackend):
         if cache is None:
             return 0
         return grouped_encoded_actual_nbytes(cache["k"]) + grouped_encoded_actual_nbytes(cache["v"])
+
+
+class Int8TritonKVCacheBackend(Int8KVCacheBackend):
+    name = "int8_triton"
+
+    def __init__(self, *args, **kwargs):
+        if not triton_is_available():
+            raise RuntimeError("Triton-backed int8 KV cache requested, but Triton is unavailable")
+        super().__init__(*args, **kwargs)
+
+    def score(self, q: Tensor, encoded_k: dict[str, Any]) -> Tensor:
+        return triton_grouped_score(
+            q.float(),
+            encoded_k["codes"],
+            encoded_k["scales"],
+            num_heads=self.num_heads,
+            group_size=int(encoded_k["group_size"]),
+        )
+
+    def apply(self, attn_probs: Tensor, encoded_v: dict[str, Any]) -> Tensor:
+        return triton_grouped_apply(
+            attn_probs.float(),
+            encoded_v["codes"],
+            encoded_v["scales"],
+            num_heads=self.num_heads,
+            group_size=int(encoded_v["group_size"]),
+        ).to(dtype=attn_probs.dtype)
 
 
 class QJLKVCacheBackend(KVCacheBackend):
@@ -959,6 +991,28 @@ class QJLKVCacheBackend(KVCacheBackend):
         key_bytes = tensor_storage_nbytes(cache["k"]["sign"]) + tensor_storage_nbytes(cache["k"]["norm"])
         val_bytes = grouped_encoded_actual_nbytes(cache["v"])
         return key_bytes + val_bytes
+
+
+class QJLTritonKVCacheBackend(QJLKVCacheBackend):
+    name = "qjl_triton"
+
+    def __init__(self, *args, **kwargs):
+        if not triton_is_available():
+            raise RuntimeError("Triton-backed QJL KV cache requested, but Triton is unavailable")
+        super().__init__(*args, **kwargs)
+
+    def score(self, q: Tensor, encoded_k: dict[str, Any]) -> Tensor:
+        q_rot = torch.matmul(q.float(), self.rotation)
+        return triton_qjl_score(q_rot, encoded_k["sign"], encoded_k["norm"], num_heads=self.num_heads)
+
+    def apply(self, attn_probs: Tensor, encoded_v: dict[str, Any]) -> Tensor:
+        return triton_grouped_apply(
+            attn_probs.float(),
+            encoded_v["codes"],
+            encoded_v["scales"],
+            num_heads=self.num_heads,
+            group_size=int(encoded_v["group_size"]),
+        ).to(dtype=attn_probs.dtype)
 
 
 class PolarKVCacheBackend(KVCacheBackend):
@@ -1182,8 +1236,16 @@ def make_named_kv_backend(
         return FloatKVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
     if name == "int8_backend":
         return Int8KVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
+    if name == "int8_triton":
+        return Int8TritonKVCacheBackend(
+            head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device
+        )
     if name == "qjl":
         return QJLKVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
+    if name == "qjl_triton":
+        return QJLTritonKVCacheBackend(
+            head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device
+        )
     if name == "polar":
         return PolarKVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
     if name == "turbo":
@@ -1707,6 +1769,8 @@ def run_kv_backend_selftests(args: Hyperparameters, device: torch.device, log0) 
     backend_names = ["none", "qjl", "polar", "turbo"]
     if args.kv_cache_baseline == "int8_backend":
         backend_names[0] = "int8_backend"
+    if triton_is_available():
+        backend_names.extend(("int8_triton", "qjl_triton"))
     for name in backend_names:
         backend = make_named_kv_backend(name, args, head_dim, args.num_heads, args.num_kv_heads, device)
         cache = None
@@ -1730,6 +1794,32 @@ def run_kv_backend_selftests(args: Hyperparameters, device: torch.device, log0) 
             qjl_err = float((score - baseline_scores).abs().mean().item())
             if qjl_err > 6.0:
                 raise AssertionError(f"QJL score drift is unexpectedly large: {qjl_err:.4f}")
+        if backend.name == "int8_triton":
+            ref_backend = Int8KVCacheBackend(
+                head_dim, args.num_heads, args.num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device
+            )
+            ref_cache = None
+            ref_cache = ref_backend.append(ref_cache, k1, v1, max_len=8)
+            ref_cache = ref_backend.append(ref_cache, k2, v2, max_len=8)
+            ref_score = ref_backend.score(q, ref_cache["k"])
+            ref_out = ref_backend.apply(torch.softmax(ref_score.float(), dim=-1).to(dtype=q.dtype), ref_cache["v"])
+            if not torch.allclose(score, ref_score, atol=2e-4, rtol=2e-4):
+                raise AssertionError("int8_triton score drift exceeds tolerance")
+            if not torch.allclose(out, ref_out, atol=2e-4, rtol=2e-4):
+                raise AssertionError("int8_triton value application drift exceeds tolerance")
+        if backend.name == "qjl_triton":
+            ref_backend = QJLKVCacheBackend(
+                head_dim, args.num_heads, args.num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device
+            )
+            ref_cache = None
+            ref_cache = ref_backend.append(ref_cache, k1, v1, max_len=8)
+            ref_cache = ref_backend.append(ref_cache, k2, v2, max_len=8)
+            ref_score = ref_backend.score(q, ref_cache["k"])
+            ref_out = ref_backend.apply(torch.softmax(ref_score.float(), dim=-1).to(dtype=q.dtype), ref_cache["v"])
+            if not torch.allclose(score, ref_score, atol=2e-4, rtol=2e-4):
+                raise AssertionError("qjl_triton score drift exceeds tolerance")
+            if not torch.allclose(out, ref_out, atol=2e-4, rtol=2e-4):
+                raise AssertionError("qjl_triton value application drift exceeds tolerance")
 
     polar_lo = PolarKVCacheBackend(head_dim, args.num_heads, args.num_kv_heads, "aggressive", args.kv_group_size, args.kv_rotation_seed, device)
     polar_hi = PolarKVCacheBackend(head_dim, args.num_heads, args.num_kv_heads, "quality", args.kv_group_size, args.kv_rotation_seed, device)
@@ -1746,6 +1836,19 @@ def run_kv_backend_selftests(args: Hyperparameters, device: torch.device, log0) 
             raise AssertionError("TurboQuant codebooks are not deterministic across identical instantiations")
 
     log0("kv_backend_selftest:passed")
+
+
+def prewarm_triton_backend(backend: KVCacheBackend, device: torch.device) -> None:
+    if not backend.name.endswith("_triton"):
+        return
+    q = torch.randn(1, backend.num_heads, 1, backend.head_dim, device=device, dtype=torch.float32)
+    k = torch.randn(1, backend.num_kv_heads, 8, backend.head_dim, device=device, dtype=torch.float32)
+    v = torch.randn(1, backend.num_kv_heads, 8, backend.head_dim, device=device, dtype=torch.float32)
+    cache = backend.append(None, k, v, max_len=8)
+    score = backend.score(q, cache["k"])
+    probs = torch.softmax(score.float(), dim=-1).to(dtype=q.dtype)
+    _ = backend.apply(probs, cache["v"])
+    torch.cuda.synchronize()
 
 
 def eval_val_autoregressive_kv(
@@ -1781,6 +1884,7 @@ def eval_val_autoregressive_kv(
     kv_cache: dict[str, Any] | None = None
 
     base_model.eval()
+    prewarm_triton_backend(backend, device)
     t0 = time.perf_counter()
     with torch.inference_mode():
         for idx in range(total_tokens):
@@ -2026,6 +2130,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:cudnn=False flash=True mem_efficient=False math={allow_math_sdp}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"triton_kv_available:{triton_is_available()}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
