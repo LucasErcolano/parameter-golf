@@ -75,6 +75,15 @@ class Hyperparameters:
     num_loops = int(os.environ.get("NUM_LOOPS", 1))
     lora_rank = int(os.environ.get("LORA_RANK", 0))
     qat = bool(int(os.environ.get("QAT", "1")))
+    qat_scheme = os.environ.get("QAT_SCHEME", "int8").strip().lower()
+    weight_quant_scheme = os.environ.get("WEIGHT_QUANT_SCHEME", os.environ.get("QAT_SCHEME", "int8")).strip().lower()
+    polar_qat_bits_mode = os.environ.get(
+        "POLAR_QAT_BITS_MODE",
+        os.environ.get("POLAR_WEIGHT_BITS_MODE", "quality"),
+    ).strip().lower()
+    polar_weight_bits_mode = os.environ.get("POLAR_WEIGHT_BITS_MODE", "quality").strip().lower()
+    polar_weight_rotate = bool(int(os.environ.get("POLAR_WEIGHT_ROTATE", "0")))
+    polar_weight_rotation_seed = int(os.environ.get("POLAR_WEIGHT_ROTATION_SEED", "4321"))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -341,6 +350,80 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
+
+_POLAR_WEIGHT_ROTATION_CACHE: dict[tuple[int, int, str], Tensor] = {}
+
+
+def get_polar_weight_rotation(dim: int, rotation_seed: int, device: torch.device) -> Tensor:
+    key = (dim, rotation_seed, str(device))
+    if key not in _POLAR_WEIGHT_ROTATION_CACHE:
+        _POLAR_WEIGHT_ROTATION_CACHE[key] = build_orthogonal_matrix(dim, rotation_seed, device)
+    return _POLAR_WEIGHT_ROTATION_CACHE[key]
+
+
+def _polar_target_dim(dim: int) -> int:
+    return 1 if dim <= 1 else 1 << (dim - 1).bit_length()
+
+
+def encode_polar_rows(
+    t: Tensor,
+    *,
+    bits_mode: str,
+    rotate: bool,
+    rotation_seed: int,
+) -> dict[str, object]:
+    t32 = t.float().contiguous()
+    orig_dim = t32.shape[-1]
+    target_dim = _polar_target_dim(orig_dim)
+    if target_dim != orig_dim:
+        t32 = F.pad(t32, (0, target_dim - orig_dim))
+    if rotate and target_dim > 1:
+        rot = get_polar_weight_rotation(target_dim, rotation_seed, t32.device)
+        t32 = torch.matmul(t32, rot)
+    levels = int(math.log2(target_dim)) if target_dim > 1 else 0
+    angle_bits = parse_polar_angle_bits(bits_mode, levels) if levels > 0 else []
+    curr = t32
+    angles: list[Tensor] = []
+    for level in range(levels):
+        a = curr[..., 0::2]
+        b = curr[..., 1::2]
+        angle = torch.atan2(b, a)
+        lo, hi = (-math.pi, math.pi) if level == 0 else (0.0, math.pi / 2.0)
+        levels_q = (1 << angle_bits[level]) - 1
+        codes = torch.clamp(torch.round((angle - lo) * levels_q / (hi - lo)), 0, levels_q).to(torch.uint8)
+        angles.append(codes.contiguous())
+        curr = torch.sqrt(a.square() + b.square() + 1e-8)
+    return {
+        "radius": curr.to(torch.float16).contiguous(),
+        "angles": angles,
+        "orig_dim": orig_dim,
+        "target_dim": target_dim,
+        "angle_bits": angle_bits,
+        "rotate": rotate,
+        "rotation_seed": rotation_seed,
+    }
+
+
+def decode_polar_rows(encoded: dict[str, object], dtype: torch.dtype) -> Tensor:
+    curr = encoded["radius"].float()
+    angle_bits = [int(bits) for bits in encoded["angle_bits"]]
+    levels = len(angle_bits)
+    for level in reversed(range(levels)):
+        codes = encoded["angles"][level].float()
+        levels_q = (1 << angle_bits[level]) - 1
+        lo, hi = (-math.pi, math.pi) if level == 0 else (0.0, math.pi / 2.0)
+        angle = lo + (hi - lo) * (codes / max(levels_q, 1))
+        a = curr * torch.cos(angle)
+        b = curr * torch.sin(angle)
+        curr = torch.stack((a, b), dim=-1).reshape(*a.shape[:-1], a.shape[-1] * 2)
+    if bool(encoded["rotate"]) and int(encoded["target_dim"]) > 1:
+        rot = get_polar_weight_rotation(int(encoded["target_dim"]), int(encoded["rotation_seed"]), curr.device)
+        curr = torch.matmul(curr, rot.T)
+    orig_dim = int(encoded["orig_dim"])
+    if curr.shape[-1] != orig_dim:
+        curr = curr[..., :orig_dim]
+    return curr.to(dtype=dtype).contiguous()
+
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -445,6 +528,136 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def quantize_state_dict_polar(
+    state_dict: dict[str, Tensor],
+    *,
+    bits_mode: str,
+    rotate: bool,
+    rotation_seed: int,
+):
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    polarized: dict[str, dict[str, object]] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        if t.ndim == 2:
+            encoded = encode_polar_rows(t, bits_mode=bits_mode, rotate=rotate, rotation_seed=rotation_seed)
+            polarized[name] = encoded
+            qmeta[name] = {
+                "scheme": "polar_row",
+                "orig_dim": int(encoded["orig_dim"]),
+                "target_dim": int(encoded["target_dim"]),
+                "angle_bits": list(encoded["angle_bits"]),
+                "rotate": bool(encoded["rotate"]),
+                "rotation_seed": int(encoded["rotation_seed"]),
+            }
+            stats["int8_payload_bytes"] += tensor_nbytes(encoded["radius"])
+            stats["int8_payload_bytes"] += sum(tensor_nbytes(angle) for angle in encoded["angles"])
+            continue
+
+        q, s = quantize_float_tensor(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q
+        scales[name] = s
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "polar_clean_per_row_v1",
+        "quantized": quantized,
+        "scales": scales,
+        "polarized": polarized,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_polar(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    qmeta = obj.get("qmeta", {})
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj.get("quantized", {}).items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name]
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            s = s.to(dtype=torch.float32)
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+        else:
+            scale = float(s.item())
+            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+    for name, encoded in obj.get("polarized", {}).items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        out[name] = decode_polar_rows(encoded, dtype=dtype)
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+
+def quantize_state_dict(
+    state_dict: dict[str, Tensor],
+    *,
+    scheme: str,
+    polar_bits_mode: str,
+    polar_rotate: bool,
+    polar_rotation_seed: int,
+):
+    if scheme == "int8":
+        return quantize_state_dict_int8(state_dict)
+    if scheme == "polar":
+        return quantize_state_dict_polar(
+            state_dict,
+            bits_mode=polar_bits_mode,
+            rotate=polar_rotate,
+            rotation_seed=polar_rotation_seed,
+        )
+    raise ValueError(f"Unsupported WEIGHT_QUANT_SCHEME={scheme!r}")
+
+
+def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
+    fmt = obj.get("__quant_format__")
+    if fmt == "int8_clean_per_row_v1":
+        return dequantize_state_dict_int8(obj)
+    if fmt == "polar_clean_per_row_v1":
+        return dequantize_state_dict_polar(obj)
+    raise ValueError(f"Unsupported quantized state dict format: {fmt!r}")
+
+
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -540,14 +753,40 @@ def fake_quantize_int8_per_row(w: Tensor) -> Tensor:
     return w + (w_deq - w).detach()
 
 
+def fake_quantize_polar_per_row(
+    w: Tensor,
+    *,
+    bits_mode: str,
+    rotate: bool,
+    rotation_seed: int,
+) -> Tensor:
+    encoded = encode_polar_rows(w, bits_mode=bits_mode, rotate=rotate, rotation_seed=rotation_seed)
+    w_deq = decode_polar_rows(encoded, dtype=w.dtype)
+    return w + (w_deq - w).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     _qat: bool = False
+    _qat_scheme: str = "int8"
+    _qat_polar_bits_mode: str = "quality"
+    _qat_polar_rotate: bool = False
+    _qat_polar_rotation_seed: int = 4321
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self._qat and self.training:
-            w = fake_quantize_int8_per_row(w)
+            if self._qat_scheme == "int8":
+                w = fake_quantize_int8_per_row(w)
+            elif self._qat_scheme == "polar":
+                w = fake_quantize_polar_per_row(
+                    w,
+                    bits_mode=self._qat_polar_bits_mode,
+                    rotate=self._qat_polar_rotate,
+                    rotation_seed=self._qat_polar_rotation_seed,
+                )
+            else:
+                raise ValueError(f"Unsupported QAT scheme: {self._qat_scheme!r}")
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -2058,10 +2297,18 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, (CastedLinear, AttentionLoRA)):
             module.float()
-        if isinstance(module, CastedLinear) and args.qat:
-            module._qat = True
+        if isinstance(module, CastedLinear):
+            module._qat = args.qat
+            module._qat_scheme = args.qat_scheme
+            module._qat_polar_bits_mode = args.polar_qat_bits_mode
+            module._qat_polar_rotate = args.polar_weight_rotate
+            module._qat_polar_rotation_seed = args.polar_weight_rotation_seed
     restore_low_dim_params_to_fp32(base_model)
-    log0(f"qat:{args.qat}")
+    log0(
+        f"qat:{args.qat} qat_scheme:{args.qat_scheme} "
+        f"weight_quant_scheme:{args.weight_quant_scheme} "
+        f"polar_bits:{args.polar_weight_bits_mode} polar_rotate:{args.polar_weight_rotate}"
+    )
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.enable_torch_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -2314,30 +2561,37 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    artifact_path = f"final_model.{args.weight_quant_scheme}.ptz"
+    quant_obj, quant_stats = quantize_state_dict(
+        base_model.state_dict(),
+        scheme=args.weight_quant_scheme,
+        polar_bits_mode=args.polar_weight_bits_mode,
+        polar_rotate=args.polar_weight_rotate,
+        polar_rotation_seed=args.polar_weight_rotation_seed,
+    )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(artifact_path, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(artifact_path)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model {args.weight_quant_scheme}+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size {args.weight_quant_scheme}+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(artifact_path, "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
     torch.cuda.synchronize()
     if args.eval_autoregressive_kv:
         backend_names = resolve_eval_backend_names(args)
