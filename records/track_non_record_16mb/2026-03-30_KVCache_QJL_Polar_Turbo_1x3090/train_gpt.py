@@ -54,6 +54,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -236,12 +237,15 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    if max_tokens > 0:
+        capped = min(tokens.numel() - 1, max_tokens)
+        tokens = tokens[: capped + 1].contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
@@ -823,6 +827,51 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def configure_qat_modules(base_model: nn.Module, args: Hyperparameters) -> None:
+    for module in base_model.modules():
+        if isinstance(module, (CastedLinear, AttentionLoRA)):
+            module.float()
+        if isinstance(module, CastedLinear):
+            module._qat = args.qat
+            module._qat_scheme = args.qat_scheme
+            module._qat_polar_bits_mode = args.polar_qat_bits_mode
+            module._qat_polar_rotate = args.polar_weight_rotate
+            module._qat_polar_rotation_seed = args.polar_weight_rotation_seed
+    restore_low_dim_params_to_fp32(base_model)
+
+
+def build_base_model(args: Hyperparameters, device: torch.device) -> "GPT":
+    base_model = GPT(
+        vocab_size=args.vocab_size,
+        num_layers=args.num_layers,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+        num_loops=args.num_loops,
+        lora_rank=args.lora_rank,
+    ).to(device).bfloat16()
+    configure_qat_modules(base_model, args)
+    return base_model
+
+
+def load_quantized_artifact(artifact_path: str | os.PathLike[str]) -> dict[str, object]:
+    with open(artifact_path, "rb") as f:
+        quant_blob_disk = f.read()
+    return torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+
+
+def load_quantized_artifact_into_model(base_model: nn.Module, artifact_path: str | os.PathLike[str]) -> dict[str, object]:
+    quant_state = load_quantized_artifact(artifact_path)
+    base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
+    return quant_state
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -834,16 +883,29 @@ class Rotary(nn.Module):
         self._sin_cached: Tensor | None = None
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        cached_inference = (
+            self._cos_cached is not None
+            and self._sin_cached is not None
+            and (
+                bool(getattr(self._cos_cached, "is_inference", lambda: False)())
+                or bool(getattr(self._sin_cached, "is_inference", lambda: False)())
+            )
+        )
         if (
             self._cos_cached is None
             or self._sin_cached is None
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
+            or (cached_inference and not torch.is_inference_mode_enabled())
         ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
+            # Keep RoPE caches as regular tensors even when the caller is under
+            # torch.inference_mode(), otherwise a later training step can fail
+            # when autograd tries to reuse inference tensors saved here.
+            with torch.inference_mode(False):
+                t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+                freqs = torch.outer(t, self.inv_freq.to(device))
+                self._cos_cached = freqs.cos()[None, None, :, :].contiguous()
+                self._sin_cached = freqs.sin()[None, None, :, :].contiguous()
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
@@ -2267,43 +2329,22 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1} "
+        f"cap:{args.val_max_tokens if args.val_max_tokens > 0 else 'full'}"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        num_loops=args.num_loops,
-        lora_rank=args.lora_rank,
-    ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, (CastedLinear, AttentionLoRA)):
-            module.float()
-        if isinstance(module, CastedLinear):
-            module._qat = args.qat
-            module._qat_scheme = args.qat_scheme
-            module._qat_polar_bits_mode = args.polar_qat_bits_mode
-            module._qat_polar_rotate = args.polar_weight_rotate
-            module._qat_polar_rotation_seed = args.polar_weight_rotation_seed
-    restore_low_dim_params_to_fp32(base_model)
+    base_model = build_base_model(args, device)
     log0(
         f"qat:{args.qat} qat_scheme:{args.qat_scheme} "
         f"weight_quant_scheme:{args.weight_quant_scheme} "
@@ -2588,10 +2629,7 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open(artifact_path, "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
+    load_quantized_artifact_into_model(base_model, artifact_path)
     torch.cuda.synchronize()
     if args.eval_autoregressive_kv:
         backend_names = resolve_eval_backend_names(args)
