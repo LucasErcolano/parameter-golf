@@ -26,7 +26,10 @@ param(
     [string]$RunId = "",
     [int]$KvEvalMaxTokens = 512,
     [int]$ValMaxTokens = 4096,
-    [int]$WarmdownIters = 0
+    [int]$WarmdownIters = 0,
+    [string]$KvQuantBackend = "qjl",
+    [string]$KvEvalCompareBackends = "",
+    [string]$KvBitsMode = "balanced"
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,7 +115,9 @@ $env:TRAIN_LOG_EVERY = "50"
 $env:VAL_LOSS_EVERY = "0"
 $env:VAL_MAX_TOKENS = "$ValMaxTokens"
 $env:EVAL_AUTOREGRESSIVE_KV = "1"
-$env:KV_QUANT_BACKEND = "qjl"
+$env:KV_QUANT_BACKEND = "$KvQuantBackend"
+$env:KV_EVAL_COMPARE_BACKENDS = "$KvEvalCompareBackends"
+$env:KV_BITS_MODE = "$KvBitsMode"
 $env:KV_EVAL_CONTEXT_LEN = "256"
 $env:KV_EVAL_MAX_TOKENS = "$KvEvalMaxTokens"
 $env:KV_BACKEND_SELFTEST = "0"
@@ -121,5 +126,5 @@ $env:MAX_WALLCLOCK_SECONDS = "$MaxWallclockSeconds"
 $env:FINALIZE_BUDGET_SECONDS = "$FinalizeBudgetSeconds"
 $env:LOG_SYNC_TO_DISK = "1"
 
-Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads LORA_RANK=$LoraRank LORA_LR=$LoraLr TIED_EMBED_LR=$TiedEmbedLr MATRIX_LR=$MatrixLr SCALAR_LR=$ScalarLr KV_TRAIN_AUX=$KvTrainAux KV_TRAIN_AUX_BACKEND=$KvTrainAuxBackend KV_TRAIN_AUX_WEIGHT=$KvTrainAuxWeight KV_TRAIN_AUX_TOKENS=$KvTrainAuxTokens KV_TRAIN_AUX_BATCH_SEQS=$KvTrainAuxBatchSeqs KV_TRAIN_AUX_EVERY=$KvTrainAuxEvery TRAIN_SEQ_LEN_INITIAL=$TrainSeqLenInitial TRAIN_SEQ_LEN_WARMUP_STEPS=$TrainSeqLenWarmupSteps TRAIN_SEQ_LEN_MIX=$TrainSeqLenMix TRAIN_SEQ_LEN_MIX_PROBS=$TrainSeqLenMixProbs ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
+Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads LORA_RANK=$LoraRank LORA_LR=$LoraLr TIED_EMBED_LR=$TiedEmbedLr MATRIX_LR=$MatrixLr SCALAR_LR=$ScalarLr KV_TRAIN_AUX=$KvTrainAux KV_TRAIN_AUX_BACKEND=$KvTrainAuxBackend KV_TRAIN_AUX_WEIGHT=$KvTrainAuxWeight KV_TRAIN_AUX_TOKENS=$KvTrainAuxTokens KV_TRAIN_AUX_BATCH_SEQS=$KvTrainAuxBatchSeqs KV_TRAIN_AUX_EVERY=$KvTrainAuxEvery TRAIN_SEQ_LEN_INITIAL=$TrainSeqLenInitial TRAIN_SEQ_LEN_WARMUP_STEPS=$TrainSeqLenWarmupSteps TRAIN_SEQ_LEN_MIX=$TrainSeqLenMix TRAIN_SEQ_LEN_MIX_PROBS=$TrainSeqLenMixProbs ITERATION_EMBED=$IterationEmbed KV_QUANT_BACKEND=$KvQuantBackend KV_EVAL_COMPARE_BACKENDS=$KvEvalCompareBackends KV_BITS_MODE=$KvBitsMode DATA_PATH=$dataRoot"
 py -3.11 train_gpt.py

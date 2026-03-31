@@ -1400,6 +1400,49 @@ class QJLSTEKVCacheBackend(QJLKVCacheBackend):
         )
 
 
+class QJLFP16ValueKVCacheBackend(QJLKVCacheBackend):
+    name = "qjl_fp16v"
+
+    def encode_v(self, x: Tensor) -> Tensor:
+        return x.to(dtype=torch.float16).contiguous()
+
+    def append(self, cache: dict[str, Any] | None, k: Tensor, v: Tensor, max_len: int) -> dict[str, Any]:
+        new_k = self.encode_k(k)
+        new_v = self.encode_v(v)
+        if cache is None:
+            out = {"k": new_k, "v": new_v}
+        else:
+            out = {
+                "k": {
+                    "sign": torch.cat((cache["k"]["sign"], new_k["sign"]), dim=2),
+                    "norm": torch.cat((cache["k"]["norm"], new_k["norm"]), dim=2),
+                },
+                "v": torch.cat((cache["v"], new_v), dim=2),
+            }
+        if max_len > 0 and out["k"]["sign"].size(2) > max_len:
+            out["k"]["sign"] = out["k"]["sign"][:, :, -max_len:, :].contiguous()
+            out["k"]["norm"] = out["k"]["norm"][:, :, -max_len:, :].contiguous()
+        if max_len > 0 and out["v"].size(2) > max_len:
+            out["v"] = out["v"][:, :, -max_len:, :].contiguous()
+        return out
+
+    def apply(self, attn_probs: Tensor, encoded_v: Tensor) -> Tensor:
+        v = expand_kv_heads(encoded_v.to(dtype=attn_probs.dtype), self.num_heads)
+        return torch.matmul(attn_probs.float(), v.float()).to(dtype=attn_probs.dtype)
+
+    def cache_nbytes(self, cache: dict[str, Any] | None) -> int:
+        if cache is None:
+            return 0
+        key_bits = logical_bytes_from_bits(cache["k"]["sign"].numel(), self.key_bits) + tensor_storage_nbytes(cache["k"]["norm"])
+        return key_bits + tensor_storage_nbytes(cache["v"])
+
+    def actual_cache_nbytes(self, cache: dict[str, Any] | None) -> int:
+        if cache is None:
+            return 0
+        key_bytes = tensor_storage_nbytes(cache["k"]["sign"]) + tensor_storage_nbytes(cache["k"]["norm"])
+        return key_bytes + tensor_storage_nbytes(cache["v"])
+
+
 class QJLTritonKVCacheBackend(QJLKVCacheBackend):
     name = "qjl_triton"
 
@@ -1651,6 +1694,10 @@ def make_named_kv_backend(
         return QJLKVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
     if name == "qjl_ste":
         return QJLSTEKVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
+    if name == "qjl_fp16v":
+        return QJLFP16ValueKVCacheBackend(
+            head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device
+        )
     if name == "qjl_triton":
         return QJLTritonKVCacheBackend(
             head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device
@@ -2192,7 +2239,7 @@ def run_kv_backend_selftests(args: Hyperparameters, device: torch.device, log0) 
     float_cache = float_backend.append(float_cache, k2, v2, max_len=8)
     baseline_scores = float_backend.score(q, float_cache["k"])
 
-    backend_names = ["none", "qjl", "polar", "turbo"]
+    backend_names = ["none", "qjl", "qjl_fp16v", "polar", "turbo"]
     if args.kv_cache_baseline == "int8_backend":
         backend_names[0] = "int8_backend"
     if triton_is_available():
