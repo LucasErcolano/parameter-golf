@@ -2581,7 +2581,7 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    max_training_wallclock_ms = 1000.0 * training_budget_seconds if args.max_wallclock_seconds > 0 else None
+    max_training_wallclock_ms: float | None = None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.lr_warmup_steps > 0:
@@ -2632,6 +2632,17 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    pre_training_wallclock_ms = 1000.0 * (time.perf_counter() - run_wallclock_t0)
+    if args.max_wallclock_seconds > 0:
+        max_training_wallclock_ms = max(
+            1000.0 * args.max_wallclock_seconds - 1000.0 * args.finalize_budget_seconds - pre_training_wallclock_ms,
+            0.0,
+        )
+        log0(
+            f"pre_training_overhead:{pre_training_wallclock_ms:.0f}ms "
+            f"train_budget_after_setup:{max_training_wallclock_ms:.0f}ms"
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
