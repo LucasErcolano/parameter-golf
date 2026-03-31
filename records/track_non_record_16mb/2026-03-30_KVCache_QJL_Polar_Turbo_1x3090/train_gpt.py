@@ -2538,7 +2538,13 @@ def main() -> None:
         f"local_microbatch_tokens:{local_tokens_per_micro_step} local_microbatch_seqs:{local_tokens_per_micro_step // args.train_seq_len}"
     )
     log0(f"sdp_backends:cudnn=False flash=True mem_efficient=False math={allow_math_sdp}")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    if args.num_kv_heads == args.num_heads:
+        attention_mode = "mha"
+    elif args.num_kv_heads == 1:
+        attention_mode = "mqa"
+    else:
+        attention_mode = "gqa"
+    log0(f"attention_mode:{attention_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"triton_kv_available:{triton_is_available()}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
