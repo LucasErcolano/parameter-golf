@@ -15,6 +15,8 @@ param(
     [int]$KvTrainAuxTokens = 64,
     [int]$KvTrainAuxBatchSeqs = 4,
     [int]$KvTrainAuxEvery = 1,
+    [int]$TrainSeqLenInitial = 256,
+    [int]$TrainSeqLenWarmupSteps = 0,
     [int]$IterationEmbed = 0,
     [double]$IterationEmbedInitStd = 0.02,
     [int]$MaxWallclockSeconds = 90,
@@ -90,6 +92,8 @@ $env:KV_TRAIN_AUX_WEIGHT = "$KvTrainAuxWeight"
 $env:KV_TRAIN_AUX_TOKENS = "$KvTrainAuxTokens"
 $env:KV_TRAIN_AUX_BATCH_SEQS = "$KvTrainAuxBatchSeqs"
 $env:KV_TRAIN_AUX_EVERY = "$KvTrainAuxEvery"
+$env:TRAIN_SEQ_LEN_INITIAL = "$TrainSeqLenInitial"
+$env:TRAIN_SEQ_LEN_WARMUP_STEPS = "$TrainSeqLenWarmupSteps"
 $env:ITERATION_EMBED = "$IterationEmbed"
 $env:ITERATION_EMBED_INIT_STD = "$IterationEmbedInitStd"
 $env:TRAIN_SEQ_LEN = "256"
@@ -112,5 +116,5 @@ $env:MAX_WALLCLOCK_SECONDS = "$MaxWallclockSeconds"
 $env:FINALIZE_BUDGET_SECONDS = "$FinalizeBudgetSeconds"
 $env:LOG_SYNC_TO_DISK = "1"
 
-Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads LORA_RANK=$LoraRank LORA_LR=$LoraLr TIED_EMBED_LR=$TiedEmbedLr MATRIX_LR=$MatrixLr SCALAR_LR=$ScalarLr KV_TRAIN_AUX=$KvTrainAux KV_TRAIN_AUX_BACKEND=$KvTrainAuxBackend KV_TRAIN_AUX_WEIGHT=$KvTrainAuxWeight KV_TRAIN_AUX_TOKENS=$KvTrainAuxTokens KV_TRAIN_AUX_BATCH_SEQS=$KvTrainAuxBatchSeqs KV_TRAIN_AUX_EVERY=$KvTrainAuxEvery ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
+Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads LORA_RANK=$LoraRank LORA_LR=$LoraLr TIED_EMBED_LR=$TiedEmbedLr MATRIX_LR=$MatrixLr SCALAR_LR=$ScalarLr KV_TRAIN_AUX=$KvTrainAux KV_TRAIN_AUX_BACKEND=$KvTrainAuxBackend KV_TRAIN_AUX_WEIGHT=$KvTrainAuxWeight KV_TRAIN_AUX_TOKENS=$KvTrainAuxTokens KV_TRAIN_AUX_BATCH_SEQS=$KvTrainAuxBatchSeqs KV_TRAIN_AUX_EVERY=$KvTrainAuxEvery TRAIN_SEQ_LEN_INITIAL=$TrainSeqLenInitial TRAIN_SEQ_LEN_WARMUP_STEPS=$TrainSeqLenWarmupSteps ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
 py -3.11 train_gpt.py

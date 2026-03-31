@@ -65,6 +65,8 @@ class Hyperparameters:
     lr_warmup_init_scale = float(os.environ.get("LR_WARMUP_INIT_SCALE", "0.0"))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len_initial = int(os.environ.get("TRAIN_SEQ_LEN_INITIAL", os.environ.get("TRAIN_SEQ_LEN", "1024")))
+    train_seq_len_warmup_steps = int(os.environ.get("TRAIN_SEQ_LEN_WARMUP_STEPS", "0"))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     finalize_budget_seconds = float(os.environ.get("FINALIZE_BUDGET_SECONDS", "15.0"))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -2497,10 +2499,22 @@ def main() -> None:
             f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must divide WORLD_SIZE*grad_accum_steps="
             f"{world_size * grad_accum_steps}"
         )
+    if args.train_seq_len_initial <= 0 or args.train_seq_len <= 0:
+        raise ValueError("TRAIN_SEQ_LEN and TRAIN_SEQ_LEN_INITIAL must be positive")
+    if args.train_seq_len_initial > args.train_seq_len:
+        raise ValueError(
+            f"TRAIN_SEQ_LEN_INITIAL={args.train_seq_len_initial} must be <= TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    if args.train_seq_len_warmup_steps < 0:
+        raise ValueError(f"TRAIN_SEQ_LEN_WARMUP_STEPS must be non-negative, got {args.train_seq_len_warmup_steps}")
     local_tokens_per_micro_step = args.train_batch_tokens // (world_size * grad_accum_steps)
     if local_tokens_per_micro_step % args.train_seq_len != 0:
         raise ValueError(
             f"Per-rank microbatch tokens {local_tokens_per_micro_step} must divide TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    if local_tokens_per_micro_step % args.train_seq_len_initial != 0:
+        raise ValueError(
+            f"Per-rank microbatch tokens {local_tokens_per_micro_step} must divide TRAIN_SEQ_LEN_INITIAL={args.train_seq_len_initial}"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -2665,6 +2679,10 @@ def main() -> None:
         f"batch_layout:global_tokens:{args.train_batch_tokens} global_seqs:{args.train_batch_tokens // args.train_seq_len} "
         f"local_microbatch_tokens:{local_tokens_per_micro_step} local_microbatch_seqs:{local_tokens_per_micro_step // args.train_seq_len}"
     )
+    log0(
+        f"train_seq_len_schedule:initial={args.train_seq_len_initial} "
+        f"switch_step={args.train_seq_len_warmup_steps} final={args.train_seq_len}"
+    )
     log0(f"sdp_backends:cudnn=False flash=True mem_efficient=False math={allow_math_sdp}")
     if args.num_kv_heads == args.num_heads:
         attention_mode = "mha"
@@ -2772,6 +2790,13 @@ def main() -> None:
         warmdown_scale = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
         return warmup_scale * warmdown_scale
 
+    def current_train_seq_len(step: int) -> int:
+        if args.train_seq_len_warmup_steps <= 0:
+            return args.train_seq_len
+        if step < args.train_seq_len_warmup_steps:
+            return args.train_seq_len_initial
+        return args.train_seq_len
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -2783,7 +2808,8 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                seq_len = current_train_seq_len(warmup_step)
+                x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -2863,7 +2889,8 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            seq_len = current_train_seq_len(step)
+            x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 main_loss = model(x, y)
                 total_loss = main_loss
@@ -2918,8 +2945,10 @@ def main() -> None:
                 if kv_train_aux_enabled
                 else ""
             )
+            current_seq_len = current_train_seq_len(step - 1)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_total_loss.item():.4f}{kv_aux_suffix} "
+                f"train_seq_len:{current_seq_len} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
                 f"lr_scale:{scale:.4f} muon_momentum:{muon_momentum:.4f}"
             )
