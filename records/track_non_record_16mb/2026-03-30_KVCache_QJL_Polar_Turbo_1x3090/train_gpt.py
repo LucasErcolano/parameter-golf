@@ -105,6 +105,12 @@ class Hyperparameters:
     kv_cache_baseline = os.environ.get("KV_CACHE_BASELINE", "float").strip().lower()
     kv_eval_compare_backends = os.environ.get("KV_EVAL_COMPARE_BACKENDS", "").strip().lower()
     kv_backend_selftest = bool(int(os.environ.get("KV_BACKEND_SELFTEST", "0")))
+    kv_train_aux = bool(int(os.environ.get("KV_TRAIN_AUX", "0")))
+    kv_train_aux_backend = os.environ.get("KV_TRAIN_AUX_BACKEND", "qjl_ste").strip().lower()
+    kv_train_aux_weight = float(os.environ.get("KV_TRAIN_AUX_WEIGHT", "0.25"))
+    kv_train_aux_tokens = int(os.environ.get("KV_TRAIN_AUX_TOKENS", "64"))
+    kv_train_aux_batch_seqs = int(os.environ.get("KV_TRAIN_AUX_BATCH_SEQS", "4"))
+    kv_train_aux_every = int(os.environ.get("KV_TRAIN_AUX_EVERY", "1"))
     enable_torch_compile = bool(int(os.environ.get("ENABLE_TORCH_COMPILE", "0")))
     log_sync_to_disk = bool(int(os.environ.get("LOG_SYNC_TO_DISK", "1")))
 
@@ -1038,6 +1044,17 @@ def dequantize_grouped_symmetric(encoded: dict[str, Any], dtype: torch.dtype) ->
     return deq.to(dtype=dtype).contiguous()
 
 
+def dequantize_grouped_symmetric_ste(x: Tensor, bits: int, group_size: int) -> Tensor:
+    encoded = quantize_grouped_symmetric(x, bits=bits, group_size=group_size)
+    deq = dequantize_grouped_symmetric(encoded, dtype=x.dtype)
+    return x + (deq - x).detach()
+
+
+def binary_sign_ste(x: Tensor) -> Tensor:
+    sign = torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
+    return x + (sign - x).detach()
+
+
 def append_grouped_encoded(encoded: dict[str, Any] | None, new_encoded: dict[str, Any], max_len: int) -> dict[str, Any]:
     if encoded is None:
         out = {key: value for key, value in new_encoded.items()}
@@ -1061,6 +1078,13 @@ def grouped_encoded_logical_nbytes(encoded: dict[str, Any] | None) -> int:
     if encoded is None:
         return 0
     return logical_bytes_from_bits(encoded["codes"].numel(), int(encoded["bits"])) + tensor_storage_nbytes(encoded["scales"])
+
+
+def append_tensor_cache(cache: Tensor | None, new_tensor: Tensor, max_len: int) -> Tensor:
+    out = new_tensor if cache is None else torch.cat((cache, new_tensor), dim=2)
+    if max_len > 0 and out.size(2) > max_len:
+        out = out[:, :, -max_len:, :]
+    return out.contiguous()
 
 
 def build_lloyd_max_codebook(bits: int, *, limit: float = 4.0, grid_size: int = 16001, steps: int = 24) -> Tensor:
@@ -1300,6 +1324,56 @@ class QJLKVCacheBackend(KVCacheBackend):
         key_bytes = tensor_storage_nbytes(cache["k"]["sign"]) + tensor_storage_nbytes(cache["k"]["norm"])
         val_bytes = grouped_encoded_actual_nbytes(cache["v"])
         return key_bytes + val_bytes
+
+
+class QJLSTEKVCacheBackend(QJLKVCacheBackend):
+    name = "qjl_ste"
+
+    def encode_k(self, x: Tensor) -> dict[str, Any]:
+        rotated = torch.matmul(x.float(), self.rotation)
+        norms = rotated.norm(dim=-1, keepdim=True).clamp_min(1e-6).contiguous()
+        signs = binary_sign_ste(rotated).contiguous()
+        return {"sign": signs, "norm": norms}
+
+    def encode_v(self, x: Tensor) -> dict[str, Any]:
+        return {"value": dequantize_grouped_symmetric_ste(x.float(), bits=self.value_bits, group_size=self.group_size).contiguous()}
+
+    def append(self, cache: dict[str, Any] | None, k: Tensor, v: Tensor, max_len: int) -> dict[str, Any]:
+        new_k = self.encode_k(k)
+        new_v = self.encode_v(v)
+        if cache is None:
+            return {"k": new_k, "v": new_v}
+        return {
+            "k": {
+                "sign": append_tensor_cache(cache["k"]["sign"], new_k["sign"], max_len),
+                "norm": append_tensor_cache(cache["k"]["norm"], new_k["norm"], max_len),
+            },
+            "v": {
+                "value": append_tensor_cache(cache["v"]["value"], new_v["value"], max_len),
+            },
+        }
+
+    def score(self, q: Tensor, encoded_k: dict[str, Any]) -> Tensor:
+        q_rot = torch.matmul(q.float(), self.rotation)
+        signs = expand_kv_heads(encoded_k["sign"].float(), self.num_heads)
+        norms = expand_kv_heads(encoded_k["norm"], self.num_heads).transpose(-1, -2).float()
+        return torch.matmul(q_rot, signs.transpose(-1, -2)) * (norms / float(self.head_dim))
+
+    def apply(self, attn_probs: Tensor, encoded_v: dict[str, Any]) -> Tensor:
+        v = expand_kv_heads(encoded_v["value"].to(dtype=attn_probs.dtype), self.num_heads)
+        return torch.matmul(attn_probs.float(), v.float()).to(dtype=attn_probs.dtype)
+
+    def cache_nbytes(self, cache: dict[str, Any] | None) -> int:
+        return self.actual_cache_nbytes(cache)
+
+    def actual_cache_nbytes(self, cache: dict[str, Any] | None) -> int:
+        if cache is None:
+            return 0
+        return (
+            tensor_storage_nbytes(cache["k"]["sign"])
+            + tensor_storage_nbytes(cache["k"]["norm"])
+            + tensor_storage_nbytes(cache["v"]["value"])
+        )
 
 
 class QJLTritonKVCacheBackend(QJLKVCacheBackend):
@@ -1551,6 +1625,8 @@ def make_named_kv_backend(
         )
     if name == "qjl":
         return QJLKVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
+    if name == "qjl_ste":
+        return QJLSTEKVCacheBackend(head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device)
     if name == "qjl_triton":
         return QJLTritonKVCacheBackend(
             head_dim, num_heads, num_kv_heads, args.kv_bits_mode, args.kv_group_size, args.kv_rotation_seed, device
@@ -2260,6 +2336,35 @@ def eval_val_autoregressive_kv(
     }
 
 
+def compute_kv_train_aux_loss(
+    args: Hyperparameters,
+    *,
+    base_model: GPT,
+    backend: KVCacheBackend,
+    x: Tensor,
+    y: Tensor,
+) -> Tensor | None:
+    if not args.kv_train_aux or args.kv_train_aux_tokens <= 0 or args.kv_train_aux_batch_seqs <= 0:
+        return None
+    aux_seq_len = min(args.kv_train_aux_tokens, x.size(1))
+    aux_batch_seqs = min(args.kv_train_aux_batch_seqs, x.size(0))
+    if aux_seq_len <= 0 or aux_batch_seqs <= 0:
+        return None
+    x_aux = x[:aux_batch_seqs, :aux_seq_len].contiguous()
+    y_aux = y[:aux_batch_seqs, :aux_seq_len].contiguous()
+    aux_logits, _ = base_model.forward_prefill(
+        x_aux,
+        backend=backend,
+        kv_cache=None,
+        max_context=min(args.kv_eval_context_len, aux_seq_len) if args.kv_eval_context_len > 0 else aux_seq_len,
+    )
+    return F.cross_entropy(
+        aux_logits.reshape(-1, aux_logits.size(-1)).float(),
+        y_aux.reshape(-1),
+        reduction="mean",
+    )
+
+
 def final_eval_after_roundtrip(
     args: Hyperparameters,
     *,
@@ -2603,12 +2708,41 @@ def main() -> None:
         f"context_len={args.kv_eval_context_len} max_tokens={args.kv_eval_max_tokens} "
         f"baseline={args.kv_cache_baseline} compare={','.join(resolve_eval_backend_names(args))}"
     )
+    kv_train_aux_enabled = (
+        args.kv_train_aux
+        and args.kv_train_aux_weight > 0.0
+        and args.kv_train_aux_every > 0
+        and args.kv_train_aux_tokens > 0
+        and args.kv_train_aux_batch_seqs > 0
+        and not distributed
+    )
+    if args.kv_train_aux and distributed:
+        log0("kv_train_aux:disabled distributed training uses the DDP wrapper, so the aux decode path stays local-only for now")
+    if kv_train_aux_enabled:
+        log0(
+            f"kv_train_aux:enabled backend={args.kv_train_aux_backend} weight={args.kv_train_aux_weight} "
+            f"tokens={args.kv_train_aux_tokens} batch_seqs={args.kv_train_aux_batch_seqs} every={args.kv_train_aux_every}"
+        )
+    else:
+        log0("kv_train_aux:enabled=False")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_kv_backend = (
+        make_named_kv_backend(
+            args.kv_train_aux_backend,
+            args,
+            head_dim=base_model.blocks[0].attn.head_dim,
+            num_heads=base_model.blocks[0].attn.num_heads,
+            num_kv_heads=base_model.blocks[0].attn.num_kv_heads,
+            device=device,
+        )
+        if kv_train_aux_enabled
+        else None
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -2724,16 +2858,38 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        train_loss = torch.zeros((), device=device)
+        train_main_loss = torch.zeros((), device=device)
+        train_kv_aux_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+                main_loss = model(x, y)
+                total_loss = main_loss
+                run_kv_aux = (
+                    kv_train_aux_enabled
+                    and train_kv_backend is not None
+                    and micro_step == 0
+                    and step % args.kv_train_aux_every == 0
+                )
+                if run_kv_aux:
+                    kv_aux_loss = compute_kv_train_aux_loss(
+                        args,
+                        base_model=base_model,
+                        backend=train_kv_backend,
+                        x=x,
+                        y=y,
+                    )
+                    if kv_aux_loss is not None:
+                        # Only the first micro-step pays the decode-path tax; scale it back up so
+                        # the effective auxiliary weight does not shrink with grad accumulation.
+                        total_loss = total_loss + args.kv_train_aux_weight * kv_aux_loss * grad_accum_steps
+                        train_kv_aux_loss += kv_aux_loss.detach()
+            train_main_loss += main_loss.detach()
+            (total_loss * grad_scale).backward()
+        train_main_loss /= grad_accum_steps
+        train_total_loss = train_main_loss + args.kv_train_aux_weight * train_kv_aux_loss
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -2757,8 +2913,13 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            kv_aux_suffix = (
+                f" main_loss:{train_main_loss.item():.4f} kv_aux:{train_kv_aux_loss.item():.4f}"
+                if kv_train_aux_enabled
+                else ""
+            )
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{train_total_loss.item():.4f}{kv_aux_suffix} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
                 f"lr_scale:{scale:.4f} muon_momentum:{muon_momentum:.4f}"
             )

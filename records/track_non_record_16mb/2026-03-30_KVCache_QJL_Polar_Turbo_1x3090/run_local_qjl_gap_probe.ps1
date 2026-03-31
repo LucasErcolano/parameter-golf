@@ -9,6 +9,12 @@ param(
     [double]$TiedEmbedLr = 0.05,
     [double]$MatrixLr = 0.04,
     [double]$ScalarLr = 0.04,
+    [int]$KvTrainAux = 0,
+    [string]$KvTrainAuxBackend = "qjl_ste",
+    [double]$KvTrainAuxWeight = 0.25,
+    [int]$KvTrainAuxTokens = 64,
+    [int]$KvTrainAuxBatchSeqs = 4,
+    [int]$KvTrainAuxEvery = 1,
     [int]$IterationEmbed = 0,
     [double]$IterationEmbedInitStd = 0.02,
     [int]$MaxWallclockSeconds = 90,
@@ -53,8 +59,9 @@ $modeLabel = if ($NumKvHeads -eq 1) { "mqa" } else { "gqa$NumKvHeads" }
 if (-not $RunId) {
     $loopLabel = "l${NumLayers}x${NumLoops}"
     $adapterLabel = if ($LoraRank -gt 0) { "lora${LoraRank}" } else { "nolora" }
+    $kvAuxLabel = if ($KvTrainAux -ne 0) { "kvaux" } else { "nokvaux" }
     $iterLabel = if ($IterationEmbed -ne 0) { "iter" } else { "plain" }
-    $RunId = "local_qjl_gap_${modeLabel}_${loopLabel}_d${ModelDim}_${adapterLabel}_${iterLabel}_${MaxWallclockSeconds}s"
+    $RunId = "local_qjl_gap_${modeLabel}_${loopLabel}_d${ModelDim}_${adapterLabel}_${kvAuxLabel}_${iterLabel}_${MaxWallclockSeconds}s"
 }
 
 $env:RUN_ID = $RunId
@@ -77,6 +84,12 @@ $env:LORA_LR = "$LoraLr"
 $env:TIED_EMBED_LR = "$TiedEmbedLr"
 $env:MATRIX_LR = "$MatrixLr"
 $env:SCALAR_LR = "$ScalarLr"
+$env:KV_TRAIN_AUX = "$KvTrainAux"
+$env:KV_TRAIN_AUX_BACKEND = "$KvTrainAuxBackend"
+$env:KV_TRAIN_AUX_WEIGHT = "$KvTrainAuxWeight"
+$env:KV_TRAIN_AUX_TOKENS = "$KvTrainAuxTokens"
+$env:KV_TRAIN_AUX_BATCH_SEQS = "$KvTrainAuxBatchSeqs"
+$env:KV_TRAIN_AUX_EVERY = "$KvTrainAuxEvery"
 $env:ITERATION_EMBED = "$IterationEmbed"
 $env:ITERATION_EMBED_INIT_STD = "$IterationEmbedInitStd"
 $env:TRAIN_SEQ_LEN = "256"
@@ -99,5 +112,5 @@ $env:MAX_WALLCLOCK_SECONDS = "$MaxWallclockSeconds"
 $env:FINALIZE_BUDGET_SECONDS = "$FinalizeBudgetSeconds"
 $env:LOG_SYNC_TO_DISK = "1"
 
-Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads LORA_RANK=$LoraRank LORA_LR=$LoraLr TIED_EMBED_LR=$TiedEmbedLr MATRIX_LR=$MatrixLr SCALAR_LR=$ScalarLr ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
+Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads LORA_RANK=$LoraRank LORA_LR=$LoraLr TIED_EMBED_LR=$TiedEmbedLr MATRIX_LR=$MatrixLr SCALAR_LR=$ScalarLr KV_TRAIN_AUX=$KvTrainAux KV_TRAIN_AUX_BACKEND=$KvTrainAuxBackend KV_TRAIN_AUX_WEIGHT=$KvTrainAuxWeight KV_TRAIN_AUX_TOKENS=$KvTrainAuxTokens KV_TRAIN_AUX_BATCH_SEQS=$KvTrainAuxBatchSeqs KV_TRAIN_AUX_EVERY=$KvTrainAuxEvery ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
 py -3.11 train_gpt.py
