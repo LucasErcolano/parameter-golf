@@ -1,5 +1,11 @@
 param(
-    [int]$NumKvHeads = 1,
+    [int]$NumKvHeads = 4,
+    [int]$NumLayers = 9,
+    [int]$NumLoops = 1,
+    [int]$ModelDim = 512,
+    [int]$NumHeads = 8,
+    [int]$IterationEmbed = 0,
+    [double]$IterationEmbedInitStd = 0.02,
     [int]$MaxWallclockSeconds = 90,
     [int]$FinalizeBudgetSeconds = 10,
     [string]$RunId = "",
@@ -34,9 +40,15 @@ if (-not $dataRoot -or -not $tokenizerPath) {
     throw "Could not locate fineweb10B_sp1024 dataset and tokenizer near $workspaceRoot"
 }
 
+if ($NumLoops -gt 1 -and -not $PSBoundParameters.ContainsKey("IterationEmbed")) {
+    $IterationEmbed = 1
+}
+
 $modeLabel = if ($NumKvHeads -eq 1) { "mqa" } else { "gqa$NumKvHeads" }
 if (-not $RunId) {
-    $RunId = "local_qjl_gap_${modeLabel}_${MaxWallclockSeconds}s"
+    $loopLabel = "l${NumLayers}x${NumLoops}"
+    $iterLabel = if ($IterationEmbed -ne 0) { "iter" } else { "plain" }
+    $RunId = "local_qjl_gap_${modeLabel}_${loopLabel}_d${ModelDim}_${iterLabel}_${MaxWallclockSeconds}s"
 }
 
 $env:RUN_ID = $RunId
@@ -49,7 +61,13 @@ $env:WEIGHT_QUANT_SCHEME = "polar"
 $env:POLAR_QAT_BITS_MODE = "quality"
 $env:POLAR_WEIGHT_BITS_MODE = "quality"
 $env:POLAR_WEIGHT_ROTATE = "0"
+$env:NUM_LAYERS = "$NumLayers"
+$env:NUM_LOOPS = "$NumLoops"
+$env:MODEL_DIM = "$ModelDim"
+$env:NUM_HEADS = "$NumHeads"
 $env:NUM_KV_HEADS = "$NumKvHeads"
+$env:ITERATION_EMBED = "$IterationEmbed"
+$env:ITERATION_EMBED_INIT_STD = "$IterationEmbedInitStd"
 $env:TRAIN_SEQ_LEN = "256"
 $env:TRAIN_BATCH_TOKENS = "65536"
 $env:ITERATIONS = "100000"
@@ -70,5 +88,5 @@ $env:MAX_WALLCLOCK_SECONDS = "$MaxWallclockSeconds"
 $env:FINALIZE_BUDGET_SECONDS = "$FinalizeBudgetSeconds"
 $env:LOG_SYNC_TO_DISK = "1"
 
-Write-Host "Running $RunId with NUM_KV_HEADS=$NumKvHeads DATA_PATH=$dataRoot"
+Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
 py -3.11 train_gpt.py

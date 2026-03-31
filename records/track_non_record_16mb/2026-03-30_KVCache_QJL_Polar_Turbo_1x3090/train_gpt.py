@@ -78,6 +78,8 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     num_loops = int(os.environ.get("NUM_LOOPS", 1))
     lora_rank = int(os.environ.get("LORA_RANK", 0))
+    iteration_embed = bool(int(os.environ.get("ITERATION_EMBED", "0")))
+    iteration_embed_init_std = float(os.environ.get("ITERATION_EMBED_INIT_STD", "0.02"))
     qat = bool(int(os.environ.get("QAT", "1")))
     qat_scheme = os.environ.get("QAT_SCHEME", "int8").strip().lower()
     weight_quant_scheme = os.environ.get("WEIGHT_QUANT_SCHEME", os.environ.get("QAT_SCHEME", "int8")).strip().lower()
@@ -329,7 +331,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,iteration_embed,iteration_embeds",
     ).split(",")
     if pattern
 )
@@ -859,6 +861,8 @@ def build_base_model(args: Hyperparameters, device: torch.device) -> "GPT":
         qk_gain_init=args.qk_gain_init,
         num_loops=args.num_loops,
         lora_rank=args.lora_rank,
+        iteration_embed=args.iteration_embed,
+        iteration_embed_init_std=args.iteration_embed_init_std,
     ).to(device).bfloat16()
     configure_qat_modules(base_model, args)
     return base_model
@@ -1744,6 +1748,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         num_loops: int = 1,
         lora_rank: int = 0,
+        iteration_embed: bool = False,
+        iteration_embed_init_std: float = 0.02,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1753,6 +1759,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.num_unique_layers = num_layers
         self.num_loops = num_loops
+        self.iteration_embed_init_std = iteration_embed_init_std
         effective_depth = num_layers * num_loops
         self.effective_depth = effective_depth
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -1760,6 +1767,10 @@ class GPT(nn.Module):
         self.num_decoder_layers = effective_depth - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        if iteration_embed and num_loops > 1:
+            self.iteration_embed = nn.Parameter(torch.empty(num_loops, model_dim, dtype=torch.float32))
+        else:
+            self.iteration_embed = None
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1796,9 +1807,16 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.iteration_embed is not None:
+            nn.init.normal_(self.iteration_embed, mean=0.0, std=self.iteration_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def _apply_iteration_embed(self, x: Tensor, loop_idx: int) -> Tensor:
+        if self.iteration_embed is None:
+            return x
+        return x + self.iteration_embed[loop_idx].to(dtype=x.dtype)[None, None, :]
 
     def forward_train(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1810,6 +1828,7 @@ class GPT(nn.Module):
         # First half (encoder) stores skip connections; second half (decoder) pops them.
         eff_idx = 0
         for loop_idx in range(self.num_loops):
+            x = self._apply_iteration_embed(x, loop_idx)
             for block_idx in range(self.num_unique_layers):
                 lora = self.lora_adapters[loop_idx][block_idx] if self.lora_adapters is not None else None
                 if eff_idx < self.num_encoder_layers:
@@ -1844,6 +1863,7 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         eff_idx = 0
         for loop_idx in range(self.num_loops):
+            x = self._apply_iteration_embed(x, loop_idx)
             for block_idx in range(self.num_unique_layers):
                 lora = self.lora_adapters[loop_idx][block_idx] if self.lora_adapters is not None else None
                 if eff_idx < self.num_encoder_layers:
@@ -1884,6 +1904,7 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         eff_idx = 0
         for loop_idx in range(self.num_loops):
+            x = self._apply_iteration_embed(x, loop_idx)
             for block_idx in range(self.num_unique_layers):
                 lora = self.lora_adapters[loop_idx][block_idx] if self.lora_adapters is not None else None
                 if eff_idx < self.num_encoder_layers:
@@ -2488,6 +2509,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.iteration_embed is not None:
+        scalar_params.append(base_model.iteration_embed)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -2545,6 +2568,10 @@ def main() -> None:
     else:
         attention_mode = "gqa"
     log0(f"attention_mode:{attention_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"loop_conditioning:iteration_embed:{int(base_model.iteration_embed is not None)} "
+        f"iteration_embed_init_std:{args.iteration_embed_init_std}"
+    )
     log0(f"triton_kv_available:{triton_is_available()}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
