@@ -4,6 +4,11 @@ param(
     [int]$NumLoops = 1,
     [int]$ModelDim = 512,
     [int]$NumHeads = 8,
+    [int]$LoraRank = 0,
+    [double]$LoraLr = 0.01,
+    [double]$TiedEmbedLr = 0.05,
+    [double]$MatrixLr = 0.04,
+    [double]$ScalarLr = 0.04,
     [int]$IterationEmbed = 0,
     [double]$IterationEmbedInitStd = 0.02,
     [int]$MaxWallclockSeconds = 90,
@@ -47,8 +52,9 @@ if ($NumLoops -gt 1 -and -not $PSBoundParameters.ContainsKey("IterationEmbed")) 
 $modeLabel = if ($NumKvHeads -eq 1) { "mqa" } else { "gqa$NumKvHeads" }
 if (-not $RunId) {
     $loopLabel = "l${NumLayers}x${NumLoops}"
+    $adapterLabel = if ($LoraRank -gt 0) { "lora${LoraRank}" } else { "nolora" }
     $iterLabel = if ($IterationEmbed -ne 0) { "iter" } else { "plain" }
-    $RunId = "local_qjl_gap_${modeLabel}_${loopLabel}_d${ModelDim}_${iterLabel}_${MaxWallclockSeconds}s"
+    $RunId = "local_qjl_gap_${modeLabel}_${loopLabel}_d${ModelDim}_${adapterLabel}_${iterLabel}_${MaxWallclockSeconds}s"
 }
 
 $env:RUN_ID = $RunId
@@ -66,6 +72,11 @@ $env:NUM_LOOPS = "$NumLoops"
 $env:MODEL_DIM = "$ModelDim"
 $env:NUM_HEADS = "$NumHeads"
 $env:NUM_KV_HEADS = "$NumKvHeads"
+$env:LORA_RANK = "$LoraRank"
+$env:LORA_LR = "$LoraLr"
+$env:TIED_EMBED_LR = "$TiedEmbedLr"
+$env:MATRIX_LR = "$MatrixLr"
+$env:SCALAR_LR = "$ScalarLr"
 $env:ITERATION_EMBED = "$IterationEmbed"
 $env:ITERATION_EMBED_INIT_STD = "$IterationEmbedInitStd"
 $env:TRAIN_SEQ_LEN = "256"
@@ -88,5 +99,5 @@ $env:MAX_WALLCLOCK_SECONDS = "$MaxWallclockSeconds"
 $env:FINALIZE_BUDGET_SECONDS = "$FinalizeBudgetSeconds"
 $env:LOG_SYNC_TO_DISK = "1"
 
-Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
+Write-Host "Running $RunId with NUM_LAYERS=$NumLayers NUM_LOOPS=$NumLoops MODEL_DIM=$ModelDim NUM_HEADS=$NumHeads NUM_KV_HEADS=$NumKvHeads LORA_RANK=$LoraRank LORA_LR=$LoraLr TIED_EMBED_LR=$TiedEmbedLr MATRIX_LR=$MatrixLr SCALAR_LR=$ScalarLr ITERATION_EMBED=$IterationEmbed DATA_PATH=$dataRoot"
 py -3.11 train_gpt.py
