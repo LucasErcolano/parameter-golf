@@ -104,6 +104,9 @@ class Hyperparameters:
     kv_qat_ramp_steps = int(os.environ.get("KV_QAT_RAMP_STEPS", "192"))
     kv_qat_recent_tokens = int(os.environ.get("KV_QAT_RECENT_TOKENS", os.environ.get("KV_RECENT_FP16_TOKENS", "8")))
     kv_qat_far_fraction = float(os.environ.get("KV_QAT_FAR_FRACTION", "1.0"))
+    kv_qat_max_scale = float(os.environ.get("KV_QAT_MAX_SCALE", "1.0"))
+    kv_qat_layer_start = int(os.environ.get("KV_QAT_LAYER_START", "0"))
+    kv_qat_layer_end = int(os.environ.get("KV_QAT_LAYER_END", "-1"))
     kv_eval_context_len = int(os.environ.get("KV_EVAL_CONTEXT_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     kv_eval_max_tokens = int(os.environ.get("KV_EVAL_MAX_TOKENS", "16384"))
     kv_cache_baseline = os.environ.get("KV_CACHE_BASELINE", "float").strip().lower()
@@ -851,8 +854,6 @@ def configure_qat_modules(base_model: nn.Module, args: Hyperparameters) -> None:
             module._qat_polar_bits_mode = args.polar_qat_bits_mode
             module._qat_polar_rotate = args.polar_weight_rotate
             module._qat_polar_rotation_seed = args.polar_weight_rotation_seed
-        if isinstance(module, CausalSelfAttention):
-            module.configure_kv_qat(args)
     restore_low_dim_params_to_fp32(base_model)
 
 
@@ -873,6 +874,7 @@ def build_base_model(args: Hyperparameters, device: torch.device) -> "GPT":
         lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     configure_qat_modules(base_model, args)
+    base_model.configure_kv_qat(args)
     return base_model
 
 
@@ -1733,15 +1735,17 @@ class CausalSelfAttention(nn.Module):
         self.kv_qat_ramp_steps = 0
         self.kv_qat_recent_tokens = 0
         self.kv_qat_far_fraction = 1.0
+        self.kv_qat_max_scale = 1.0
         self.kv_qat_scale = 0.0
         self.kv_qat_rotation: Tensor | None = None
 
-    def configure_kv_qat(self, args: Hyperparameters) -> None:
-        self.kv_qat_enabled = args.kv_qat
+    def configure_kv_qat(self, args: Hyperparameters, *, enabled: bool | None = None) -> None:
+        self.kv_qat_enabled = args.kv_qat if enabled is None else bool(enabled)
         self.kv_qat_start_step = max(0, args.kv_qat_start_step)
         self.kv_qat_ramp_steps = max(0, args.kv_qat_ramp_steps)
         self.kv_qat_recent_tokens = max(0, args.kv_qat_recent_tokens)
         self.kv_qat_far_fraction = min(max(args.kv_qat_far_fraction, 0.0), 1.0)
+        self.kv_qat_max_scale = min(max(args.kv_qat_max_scale, 0.0), 1.0)
         self.kv_qat_scale = 0.0
         self.kv_qat_rotation = build_orthogonal_matrix(
             self.head_dim,
@@ -1756,9 +1760,10 @@ class CausalSelfAttention(nn.Module):
         if step < self.kv_qat_start_step:
             self.kv_qat_scale = 0.0
         elif self.kv_qat_ramp_steps <= 0:
-            self.kv_qat_scale = 1.0
+            self.kv_qat_scale = self.kv_qat_max_scale
         else:
-            self.kv_qat_scale = min((step - self.kv_qat_start_step + 1) / self.kv_qat_ramp_steps, 1.0)
+            frac = min((step - self.kv_qat_start_step + 1) / self.kv_qat_ramp_steps, 1.0)
+            self.kv_qat_scale = self.kv_qat_max_scale * frac
 
     def _qjl_score_approx_ste(self, q: Tensor, k: Tensor) -> Tensor:
         if self.kv_qat_rotation is None:
@@ -2014,6 +2019,13 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def configure_kv_qat(self, args: Hyperparameters) -> None:
+        start = max(0, args.kv_qat_layer_start)
+        end = self.num_unique_layers - 1 if args.kv_qat_layer_end < 0 else min(args.kv_qat_layer_end, self.num_unique_layers - 1)
+        for block_idx, block in enumerate(self.blocks):
+            enabled = args.kv_qat and start <= block_idx <= end
+            block.attn.configure_kv_qat(args, enabled=enabled)
 
     def set_kv_qat_step(self, step: int | None) -> None:
         for block in self.blocks:
@@ -2798,7 +2810,8 @@ def main() -> None:
     log0(
         f"kv_qat:enabled={args.kv_qat} start_step={args.kv_qat_start_step} "
         f"ramp_steps={args.kv_qat_ramp_steps} recent_tokens={args.kv_qat_recent_tokens} "
-        f"far_fraction={args.kv_qat_far_fraction:.3f}"
+        f"far_fraction={args.kv_qat_far_fraction:.3f} max_scale={args.kv_qat_max_scale:.3f} "
+        f"layers={args.kv_qat_layer_start}:{args.kv_qat_layer_end}"
     )
 
     # -----------------------------
