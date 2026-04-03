@@ -12,6 +12,8 @@ param(
     [double]$KvQatMaxScale = 1.0,
     [int]$KvQatLayerStart = 0,
     [int]$KvQatLayerEnd = -1,
+    [int]$KvQatHeadStart = 0,
+    [int]$KvQatHeadEnd = -1,
     [int]$KvEvalMaxTokens = 512,
     [int]$ValMaxTokens = 4096
 )
@@ -72,6 +74,8 @@ $env:KV_QAT_FAR_FRACTION = "$KvQatFarFraction"
 $env:KV_QAT_MAX_SCALE = "$KvQatMaxScale"
 $env:KV_QAT_LAYER_START = "$KvQatLayerStart"
 $env:KV_QAT_LAYER_END = "$KvQatLayerEnd"
+$env:KV_QAT_HEAD_START = "$KvQatHeadStart"
+$env:KV_QAT_HEAD_END = "$KvQatHeadEnd"
 $env:KV_EVAL_CONTEXT_LEN = "256"
 $env:KV_EVAL_MAX_TOKENS = "$KvEvalMaxTokens"
 $env:KV_BACKEND_SELFTEST = "0"
@@ -80,5 +84,5 @@ $env:MAX_WALLCLOCK_SECONDS = "$MaxWallclockSeconds"
 $env:FINALIZE_BUDGET_SECONDS = "$FinalizeBudgetSeconds"
 $env:LOG_SYNC_TO_DISK = "1"
 
-Write-Host "Running $RunId with KV_QUANT_BACKEND=$env:KV_QUANT_BACKEND KV_EVAL_COMPARE_BACKENDS=$KvEvalCompareBackends KV_RECENT_FP16_TOKENS=$KvRecentFp16Tokens KV_QAT=$KvQat KV_QAT_RECENT_TOKENS=$KvQatRecentTokens KV_QAT_FAR_FRACTION=$KvQatFarFraction KV_QAT_MAX_SCALE=$KvQatMaxScale KV_QAT_LAYERS=$KvQatLayerStart`:$KvQatLayerEnd DATA_PATH=$dataRoot"
+Write-Host "Running $RunId with KV_QUANT_BACKEND=$env:KV_QUANT_BACKEND KV_EVAL_COMPARE_BACKENDS=$KvEvalCompareBackends KV_RECENT_FP16_TOKENS=$KvRecentFp16Tokens KV_QAT=$KvQat KV_QAT_RECENT_TOKENS=$KvQatRecentTokens KV_QAT_FAR_FRACTION=$KvQatFarFraction KV_QAT_MAX_SCALE=$KvQatMaxScale KV_QAT_LAYERS=$KvQatLayerStart`:$KvQatLayerEnd KV_QAT_HEADS=$KvQatHeadStart`:$KvQatHeadEnd DATA_PATH=$dataRoot"
 py -3.11 train_gpt.py

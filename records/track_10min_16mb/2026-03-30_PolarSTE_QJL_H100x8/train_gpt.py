@@ -107,6 +107,8 @@ class Hyperparameters:
     kv_qat_max_scale = float(os.environ.get("KV_QAT_MAX_SCALE", "1.0"))
     kv_qat_layer_start = int(os.environ.get("KV_QAT_LAYER_START", "0"))
     kv_qat_layer_end = int(os.environ.get("KV_QAT_LAYER_END", "-1"))
+    kv_qat_head_start = int(os.environ.get("KV_QAT_HEAD_START", "0"))
+    kv_qat_head_end = int(os.environ.get("KV_QAT_HEAD_END", "-1"))
     kv_eval_context_len = int(os.environ.get("KV_EVAL_CONTEXT_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     kv_eval_max_tokens = int(os.environ.get("KV_EVAL_MAX_TOKENS", "16384"))
     kv_cache_baseline = os.environ.get("KV_CACHE_BASELINE", "float").strip().lower()
@@ -1736,6 +1738,9 @@ class CausalSelfAttention(nn.Module):
         self.kv_qat_recent_tokens = 0
         self.kv_qat_far_fraction = 1.0
         self.kv_qat_max_scale = 1.0
+        self.kv_qat_head_start = 0
+        self.kv_qat_head_end = num_heads - 1
+        self.kv_qat_head_mask: Tensor | None = None
         self.kv_qat_scale = 0.0
         self.kv_qat_rotation: Tensor | None = None
 
@@ -1746,12 +1751,18 @@ class CausalSelfAttention(nn.Module):
         self.kv_qat_recent_tokens = max(0, args.kv_qat_recent_tokens)
         self.kv_qat_far_fraction = min(max(args.kv_qat_far_fraction, 0.0), 1.0)
         self.kv_qat_max_scale = min(max(args.kv_qat_max_scale, 0.0), 1.0)
+        self.kv_qat_head_start = min(max(args.kv_qat_head_start, 0), self.num_heads - 1)
+        self.kv_qat_head_end = self.num_heads - 1 if args.kv_qat_head_end < 0 else min(args.kv_qat_head_end, self.num_heads - 1)
         self.kv_qat_scale = 0.0
         self.kv_qat_rotation = build_orthogonal_matrix(
             self.head_dim,
             args.kv_rotation_seed,
             self.q_gain.device,
         )
+        head_mask = torch.zeros((1, self.num_heads, 1, 1), device=self.q_gain.device, dtype=torch.float32)
+        if self.kv_qat_enabled and self.kv_qat_head_start <= self.kv_qat_head_end:
+            head_mask[:, self.kv_qat_head_start : self.kv_qat_head_end + 1] = 1.0
+        self.kv_qat_head_mask = head_mask
 
     def set_kv_qat_step(self, step: int | None) -> None:
         if not self.kv_qat_enabled or step is None:
@@ -1800,7 +1811,10 @@ class CausalSelfAttention(nn.Module):
             oldest_threshold = float(self.kv_qat_recent_tokens) + keep_far
             far_history = far_history & (dist.to(torch.float32) >= oldest_threshold)
         far_history = far_history.view(1, 1, seqlen, seqlen)
-        scores = exact_scores + (approx_scores - exact_scores) * (self.kv_qat_scale * far_history.to(dtype=exact_scores.dtype))
+        head_mask = 1.0 if self.kv_qat_head_mask is None else self.kv_qat_head_mask.to(dtype=exact_scores.dtype)
+        scores = exact_scores + (approx_scores - exact_scores) * (
+            self.kv_qat_scale * head_mask * far_history.to(dtype=exact_scores.dtype)
+        )
         scores = scores.masked_fill(~causal.view(1, 1, seqlen, seqlen), float("-inf"))
 
         attn_probs = torch.softmax(scores, dim=-1).to(dtype=q.dtype)
@@ -2811,7 +2825,8 @@ def main() -> None:
         f"kv_qat:enabled={args.kv_qat} start_step={args.kv_qat_start_step} "
         f"ramp_steps={args.kv_qat_ramp_steps} recent_tokens={args.kv_qat_recent_tokens} "
         f"far_fraction={args.kv_qat_far_fraction:.3f} max_scale={args.kv_qat_max_scale:.3f} "
-        f"layers={args.kv_qat_layer_start}:{args.kv_qat_layer_end}"
+        f"layers={args.kv_qat_layer_start}:{args.kv_qat_layer_end} "
+        f"heads={args.kv_qat_head_start}:{args.kv_qat_head_end}"
     )
 
     # -----------------------------
