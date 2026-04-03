@@ -99,6 +99,10 @@ class Hyperparameters:
     kv_rotation_seed = int(os.environ.get("KV_ROTATION_SEED", 1234))
     kv_group_size = int(os.environ.get("KV_GROUP_SIZE", 16))
     kv_recent_fp16_tokens = int(os.environ.get("KV_RECENT_FP16_TOKENS", "8"))
+    kv_qat = bool(int(os.environ.get("KV_QAT", "0")))
+    kv_qat_start_step = int(os.environ.get("KV_QAT_START_STEP", "64"))
+    kv_qat_ramp_steps = int(os.environ.get("KV_QAT_RAMP_STEPS", "192"))
+    kv_qat_recent_tokens = int(os.environ.get("KV_QAT_RECENT_TOKENS", os.environ.get("KV_RECENT_FP16_TOKENS", "8")))
     kv_eval_context_len = int(os.environ.get("KV_EVAL_CONTEXT_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     kv_eval_max_tokens = int(os.environ.get("KV_EVAL_MAX_TOKENS", "16384"))
     kv_cache_baseline = os.environ.get("KV_CACHE_BASELINE", "float").strip().lower()
@@ -774,6 +778,10 @@ def fake_quantize_polar_per_row(
     return w + (w_deq - w).detach()
 
 
+def ste_passthrough(x: Tensor, approx: Tensor) -> Tensor:
+    return x + (approx - x).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     _qat: bool = False
@@ -842,6 +850,8 @@ def configure_qat_modules(base_model: nn.Module, args: Hyperparameters) -> None:
             module._qat_polar_bits_mode = args.polar_qat_bits_mode
             module._qat_polar_rotate = args.polar_weight_rotate
             module._qat_polar_rotation_seed = args.polar_weight_rotation_seed
+        if isinstance(module, CausalSelfAttention):
+            module.configure_kv_qat(args)
     restore_low_dim_params_to_fp32(base_model)
 
 
@@ -1717,6 +1727,69 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.kv_qat_enabled = False
+        self.kv_qat_start_step = 0
+        self.kv_qat_ramp_steps = 0
+        self.kv_qat_recent_tokens = 0
+        self.kv_qat_scale = 0.0
+        self.kv_qat_rotation: Tensor | None = None
+
+    def configure_kv_qat(self, args: Hyperparameters) -> None:
+        self.kv_qat_enabled = args.kv_qat
+        self.kv_qat_start_step = max(0, args.kv_qat_start_step)
+        self.kv_qat_ramp_steps = max(0, args.kv_qat_ramp_steps)
+        self.kv_qat_recent_tokens = max(0, args.kv_qat_recent_tokens)
+        self.kv_qat_scale = 0.0
+        self.kv_qat_rotation = build_orthogonal_matrix(
+            self.head_dim,
+            args.kv_rotation_seed,
+            self.q_gain.device,
+        )
+
+    def set_kv_qat_step(self, step: int | None) -> None:
+        if not self.kv_qat_enabled or step is None:
+            self.kv_qat_scale = 0.0
+            return
+        if step < self.kv_qat_start_step:
+            self.kv_qat_scale = 0.0
+        elif self.kv_qat_ramp_steps <= 0:
+            self.kv_qat_scale = 1.0
+        else:
+            self.kv_qat_scale = min((step - self.kv_qat_start_step + 1) / self.kv_qat_ramp_steps, 1.0)
+
+    def _qjl_score_approx_ste(self, q: Tensor, k: Tensor) -> Tensor:
+        if self.kv_qat_rotation is None:
+            raise RuntimeError("KV-QAT rotation was not configured")
+        q_rot = torch.matmul(q.float(), self.kv_qat_rotation)
+        k_rot = torch.matmul(k.float(), self.kv_qat_rotation)
+        norm = k_rot.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        norm_q = ste_passthrough(norm, norm.to(torch.float16).float())
+        sign = torch.where(k_rot >= 0, torch.ones_like(k_rot), -torch.ones_like(k_rot))
+        sign_ste = ste_passthrough(k_rot, sign)
+        sign_ste = expand_kv_heads(sign_ste, self.num_heads)
+        norm_q = expand_kv_heads(norm_q, self.num_heads).transpose(-1, -2).float()
+        return torch.matmul(q_rot, sign_ste.transpose(-1, -2)) * (norm_q / float(self.head_dim))
+
+    def _forward_train_with_kv_qat(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        bsz, _, seqlen, _ = q.shape
+        exact_k = expand_kv_heads(k, self.num_heads)
+        exact_scores = torch.matmul(q.float(), exact_k.transpose(-1, -2).float()) / math.sqrt(self.head_dim)
+        approx_scores = self._qjl_score_approx_ste(q, k)
+
+        idx = torch.arange(seqlen, device=q.device)
+        causal = idx[:, None] >= idx[None, :]
+        if self.kv_qat_recent_tokens > 0:
+            recent = (idx[:, None] - idx[None, :]) < self.kv_qat_recent_tokens
+            far_history = causal & ~recent
+        else:
+            far_history = causal
+        far_history = far_history.view(1, 1, seqlen, seqlen)
+        scores = exact_scores + (approx_scores - exact_scores) * (self.kv_qat_scale * far_history.to(dtype=exact_scores.dtype))
+        scores = scores.masked_fill(~causal.view(1, 1, seqlen, seqlen), float("-inf"))
+
+        attn_probs = torch.softmax(scores, dim=-1).to(dtype=q.dtype)
+        exact_v = expand_kv_heads(v, self.num_heads)
+        return torch.matmul(attn_probs.float(), exact_v.float()).to(dtype=q.dtype)
 
     def _project_qkv(self, x: Tensor, lora: AttentionLoRA | None = None) -> tuple[Tensor, Tensor, Tensor]:
         q = self.c_q(x)
@@ -1742,14 +1815,17 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.training and self.kv_qat_enabled and self.kv_qat_scale > 0.0:
+            y = self._forward_train_with_kv_qat(q, k, v)
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         out = self.proj(y)
         if lora is not None:
@@ -1927,6 +2003,15 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def set_kv_qat_step(self, step: int | None) -> None:
+        for block in self.blocks:
+            block.attn.set_kv_qat_step(step)
+
+    def current_kv_qat_scale(self) -> float:
+        if not self.blocks:
+            return 0.0
+        return float(self.blocks[0].attn.kv_qat_scale)
 
     def forward_train(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -2699,6 +2784,10 @@ def main() -> None:
         f"context_len={args.kv_eval_context_len} max_tokens={args.kv_eval_max_tokens} "
         f"baseline={args.kv_cache_baseline} compare={','.join(resolve_eval_backend_names(args))}"
     )
+    log0(
+        f"kv_qat:enabled={args.kv_qat} start_step={args.kv_qat_start_step} "
+        f"ramp_steps={args.kv_qat_ramp_steps} recent_tokens={args.kv_qat_recent_tokens}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -2741,6 +2830,7 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
+            base_model.set_kv_qat_step(warmup_step)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -2819,6 +2909,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        base_model.set_kv_qat_step(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -2856,7 +2947,8 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
-                f"lr_scale:{scale:.4f} muon_momentum:{muon_momentum:.4f}"
+                f"lr_scale:{scale:.4f} muon_momentum:{muon_momentum:.4f} "
+                f"kv_qat_scale:{base_model.current_kv_qat_scale():.4f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
