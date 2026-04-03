@@ -103,6 +103,7 @@ class Hyperparameters:
     kv_qat_start_step = int(os.environ.get("KV_QAT_START_STEP", "64"))
     kv_qat_ramp_steps = int(os.environ.get("KV_QAT_RAMP_STEPS", "192"))
     kv_qat_recent_tokens = int(os.environ.get("KV_QAT_RECENT_TOKENS", os.environ.get("KV_RECENT_FP16_TOKENS", "8")))
+    kv_qat_far_fraction = float(os.environ.get("KV_QAT_FAR_FRACTION", "1.0"))
     kv_eval_context_len = int(os.environ.get("KV_EVAL_CONTEXT_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     kv_eval_max_tokens = int(os.environ.get("KV_EVAL_MAX_TOKENS", "16384"))
     kv_cache_baseline = os.environ.get("KV_CACHE_BASELINE", "float").strip().lower()
@@ -1731,6 +1732,7 @@ class CausalSelfAttention(nn.Module):
         self.kv_qat_start_step = 0
         self.kv_qat_ramp_steps = 0
         self.kv_qat_recent_tokens = 0
+        self.kv_qat_far_fraction = 1.0
         self.kv_qat_scale = 0.0
         self.kv_qat_rotation: Tensor | None = None
 
@@ -1739,6 +1741,7 @@ class CausalSelfAttention(nn.Module):
         self.kv_qat_start_step = max(0, args.kv_qat_start_step)
         self.kv_qat_ramp_steps = max(0, args.kv_qat_ramp_steps)
         self.kv_qat_recent_tokens = max(0, args.kv_qat_recent_tokens)
+        self.kv_qat_far_fraction = min(max(args.kv_qat_far_fraction, 0.0), 1.0)
         self.kv_qat_scale = 0.0
         self.kv_qat_rotation = build_orthogonal_matrix(
             self.head_dim,
@@ -1777,12 +1780,20 @@ class CausalSelfAttention(nn.Module):
         approx_scores = self._qjl_score_approx_ste(q, k)
 
         idx = torch.arange(seqlen, device=q.device)
-        causal = idx[:, None] >= idx[None, :]
+        q_idx = idx[:, None]
+        k_idx = idx[None, :]
+        dist = q_idx - k_idx
+        causal = dist >= 0
         if self.kv_qat_recent_tokens > 0:
-            recent = (idx[:, None] - idx[None, :]) < self.kv_qat_recent_tokens
+            recent = dist < self.kv_qat_recent_tokens
             far_history = causal & ~recent
         else:
             far_history = causal
+        if self.kv_qat_far_fraction < 1.0:
+            far_counts = (q_idx + 1 - self.kv_qat_recent_tokens).clamp_min(0).to(torch.float32)
+            keep_far = torch.floor((1.0 - self.kv_qat_far_fraction) * far_counts)
+            oldest_threshold = float(self.kv_qat_recent_tokens) + keep_far
+            far_history = far_history & (dist.to(torch.float32) >= oldest_threshold)
         far_history = far_history.view(1, 1, seqlen, seqlen)
         scores = exact_scores + (approx_scores - exact_scores) * (self.kv_qat_scale * far_history.to(dtype=exact_scores.dtype))
         scores = scores.masked_fill(~causal.view(1, 1, seqlen, seqlen), float("-inf"))
@@ -2786,7 +2797,8 @@ def main() -> None:
     )
     log0(
         f"kv_qat:enabled={args.kv_qat} start_step={args.kv_qat_start_step} "
-        f"ramp_steps={args.kv_qat_ramp_steps} recent_tokens={args.kv_qat_recent_tokens}"
+        f"ramp_steps={args.kv_qat_ramp_steps} recent_tokens={args.kv_qat_recent_tokens} "
+        f"far_fraction={args.kv_qat_far_fraction:.3f}"
     )
 
     # -----------------------------

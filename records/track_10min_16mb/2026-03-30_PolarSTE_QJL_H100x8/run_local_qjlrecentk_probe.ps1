@@ -8,6 +8,7 @@ param(
     [int]$KvQatStartStep = 64,
     [int]$KvQatRampSteps = 192,
     [int]$KvQatRecentTokens = 8,
+    [double]$KvQatFarFraction = 1.0,
     [int]$KvEvalMaxTokens = 512,
     [int]$ValMaxTokens = 4096
 )
@@ -64,6 +65,7 @@ $env:KV_QAT = "$KvQat"
 $env:KV_QAT_START_STEP = "$KvQatStartStep"
 $env:KV_QAT_RAMP_STEPS = "$KvQatRampSteps"
 $env:KV_QAT_RECENT_TOKENS = "$KvQatRecentTokens"
+$env:KV_QAT_FAR_FRACTION = "$KvQatFarFraction"
 $env:KV_EVAL_CONTEXT_LEN = "256"
 $env:KV_EVAL_MAX_TOKENS = "$KvEvalMaxTokens"
 $env:KV_BACKEND_SELFTEST = "0"
@@ -72,5 +74,5 @@ $env:MAX_WALLCLOCK_SECONDS = "$MaxWallclockSeconds"
 $env:FINALIZE_BUDGET_SECONDS = "$FinalizeBudgetSeconds"
 $env:LOG_SYNC_TO_DISK = "1"
 
-Write-Host "Running $RunId with KV_QUANT_BACKEND=$env:KV_QUANT_BACKEND KV_EVAL_COMPARE_BACKENDS=$KvEvalCompareBackends KV_RECENT_FP16_TOKENS=$KvRecentFp16Tokens KV_QAT=$KvQat KV_QAT_RECENT_TOKENS=$KvQatRecentTokens DATA_PATH=$dataRoot"
+Write-Host "Running $RunId with KV_QUANT_BACKEND=$env:KV_QUANT_BACKEND KV_EVAL_COMPARE_BACKENDS=$KvEvalCompareBackends KV_RECENT_FP16_TOKENS=$KvRecentFp16Tokens KV_QAT=$KvQat KV_QAT_RECENT_TOKENS=$KvQatRecentTokens KV_QAT_FAR_FRACTION=$KvQatFarFraction DATA_PATH=$dataRoot"
 py -3.11 train_gpt.py
