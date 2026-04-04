@@ -387,9 +387,9 @@ class BackoffNgramMixer:
                 continue
             rows = active_rows[eligible]
             cols = active_cols[eligible]
-            ctx_h = x_batch[rows, cols] * self.PRIMES[0]
+            ctx_h = x_batch[rows, cols - (cw - 1)] * self.PRIMES[0]
             for k in range(1, cw):
-                ctx_h = ctx_h ^ (x_batch[rows, cols - k] * self.PRIMES[k % len(self.PRIMES)])
+                ctx_h = ctx_h ^ (x_batch[rows, cols - (cw - 1) + k] * self.PRIMES[k % len(self.PRIMES)])
             ctx_key = self._bucket(ctx_h)
             full_h = ctx_h ^ (y_batch[rows, cols] * self.PRIMES[(order - 1) % len(self.PRIMES)])
             full_key = self._bucket(full_h)

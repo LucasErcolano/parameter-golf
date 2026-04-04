@@ -10,7 +10,7 @@ This submission drastically reduces the BPB by combining a highly optimized neur
 * **Seed 42:** 0.418682 BPB
 * **Seed 1337:** 0.416106 BPB
 * **Seed 7:** 0.421661 BPB
-* **Average:** **0.418816 BPB**
+* **Average:** **0.418817 BPB**
 
 *All runs comfortably complete within the 600s time limit and comply with the 16MB artifact constraint (Max artifact size: 15.66 MB).*
 
@@ -32,7 +32,7 @@ The evaluation loop utilizes a Backoff N-gram Mixer with entropy-adaptive alpha 
 
 ### Base Neural Stack (Derived from PR #549)
 * 11L GQA Transformer, 512d, 8 heads, 4 KV heads.
-* MLP 3.0x with LeakyReLU(0.75)².
+* MLP 3.0x with LeakyReLU(0.5)².
 * Parallel Muon optimizer.
 * SmearGate + BigramHash(2048) + OrthoInit.
 * Value-Residual Embeddings (VE128).

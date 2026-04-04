@@ -1,7 +1,7 @@
 {
   "name": "Lucas Ercolano",
   "github_id": "LucasErcolano",
-  "val_bpb": 0.418816,
+  "val_bpb": 0.418817,
   "best_val_bpb": 0.416106,
   "hardware": "8xH100 SXM",
   "time_seconds": 600,
