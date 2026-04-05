@@ -40,7 +40,7 @@ class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     _base_dir = os.path.dirname(os.path.abspath(__file__))
     _root_dir = os.path.abspath(os.path.join(_base_dir, "../../..")) if "records" in _base_dir else _base_dir
-    data_path = os.environ.get("DATA_PATH", os.path.join(_root_dir, "data/datasets/fineweb10B_sp1024"))
+    data_path = os.environ.get("DATA_PATH", os.path.join(_root_dir, "data/datasets/fineweb10B_sp4096"))
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", os.path.join(_root_dir, "data/tokenizers/fineweb_1024_bpe.model"))
@@ -152,6 +152,8 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    row_norms = g.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                    g = g / row_norms
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
@@ -887,10 +889,11 @@ def main() -> None:
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
+        optimizer_head = torch.optim.AdamW(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay,
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
