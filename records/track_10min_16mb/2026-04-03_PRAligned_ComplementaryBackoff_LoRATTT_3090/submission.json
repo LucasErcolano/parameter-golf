@@ -1,0 +1,6 @@
+{
+  "name": "PRAligned_ComplementaryBackoff_LoRATTT_3090",
+  "track": "track_10min_16mb",
+  "entrypoint": "train_gpt.py",
+  "notes": "Local PR-aligned phases 1-3 package with compliant LoRA TTT and causal BackoffNgramMixer."
+}
