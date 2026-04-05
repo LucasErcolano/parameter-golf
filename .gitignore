@@ -16,7 +16,6 @@ logs/
 checkpoints/
 local_runs/
 records/track_10min_16mb/joaco_test_submission/
-*.txt
 
 
 .env
